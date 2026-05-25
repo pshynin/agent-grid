@@ -138,6 +138,59 @@ func (s *Store) CreateAgentWithClaims(ctx context.Context, a core.Agent, claims 
 	return tx.Commit()
 }
 
+// --- Diff snapshots --------------------------------------------------------
+
+// CreateDiffSnapshot appends a new snapshot. The latest row per agent is
+// considered "current".
+func (s *Store) CreateDiffSnapshot(ctx context.Context, d core.DiffSnapshot) error {
+	touched, err := json.Marshal(emptyStringsToNil(d.TouchedFiles))
+	if err != nil {
+		return fmt.Errorf("encode touched_files: %w", err)
+	}
+	forbidden, err := json.Marshal(emptyStringsToNil(d.ForbiddenHits))
+	if err != nil {
+		return fmt.Errorf("encode forbidden_hits: %w", err)
+	}
+	violations, err := json.Marshal(emptyStringsToNil(d.ClaimViolations))
+	if err != nil {
+		return fmt.Errorf("encode claim_violations: %w", err)
+	}
+	reasons, err := json.Marshal(emptyReasonsToNil(d.RiskReasons))
+	if err != nil {
+		return fmt.Errorf("encode risk_reasons: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO diff_snapshots
+		   (id, agent_id, head_commit, files_changed, lines_added, lines_removed,
+		    touched_files, forbidden_hits, claim_violations,
+		    risk_level, risk_reasons, taken_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		d.ID, d.AgentID, d.HeadCommit, d.FilesChanged, d.LinesAdded, d.LinesRemoved,
+		string(touched), string(forbidden), string(violations),
+		string(d.RiskLevel), string(reasons),
+		d.TakenAt.UTC().Format(timeFmt),
+	)
+	return err
+}
+
+// LatestDiffSnapshotByAgent returns the most recently inserted snapshot for
+// the agent, or ErrNotFound when no snapshot exists.
+func (s *Store) LatestDiffSnapshotByAgent(ctx context.Context, agentID string) (core.DiffSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, diffSelectLatest, agentID)
+	d, err := scanDiffSnapshot(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.DiffSnapshot{}, ErrNotFound
+	}
+	return d, err
+}
+
+func emptyReasonsToNil(r []core.Reason) []core.Reason {
+	if len(r) == 0 {
+		return []core.Reason{}
+	}
+	return r
+}
+
 // --- Stale marks -----------------------------------------------------------
 
 // ListStaleMarks returns every current stale mark across all agents, ordered
@@ -214,6 +267,14 @@ const (
 
 	staleCols      = `id, agent_id, reason, conflicting_files, recommendation, created_at`
 	staleSelectAll = `SELECT ` + staleCols + ` FROM stale_marks ORDER BY created_at ASC, id ASC`
+
+	diffCols         = `id, agent_id, head_commit, files_changed, lines_added, lines_removed,
+	                    touched_files, forbidden_hits, claim_violations,
+	                    risk_level, risk_reasons, taken_at`
+	diffSelectLatest = `SELECT ` + diffCols + ` FROM diff_snapshots
+	                    WHERE agent_id = ?
+	                    ORDER BY taken_at DESC, id DESC
+	                    LIMIT 1`
 )
 
 type rowScanner interface {
@@ -286,6 +347,44 @@ func scanStaleMark(r rowScanner) (core.StaleMark, error) {
 		}
 	}
 	return m, nil
+}
+
+func scanDiffSnapshot(r rowScanner) (core.DiffSnapshot, error) {
+	var d core.DiffSnapshot
+	var risk, takenAt string
+	var touched, forbidden, violations, reasons string
+	if err := r.Scan(&d.ID, &d.AgentID, &d.HeadCommit,
+		&d.FilesChanged, &d.LinesAdded, &d.LinesRemoved,
+		&touched, &forbidden, &violations,
+		&risk, &reasons, &takenAt); err != nil {
+		return core.DiffSnapshot{}, err
+	}
+	d.RiskLevel = core.RiskLevel(risk)
+	t, err := time.Parse(timeFmt, takenAt)
+	if err != nil {
+		return core.DiffSnapshot{}, fmt.Errorf("parse taken_at: %w", err)
+	}
+	d.TakenAt = t
+	if err := decodeJSONSlice(touched, &d.TouchedFiles); err != nil {
+		return core.DiffSnapshot{}, fmt.Errorf("decode touched_files: %w", err)
+	}
+	if err := decodeJSONSlice(forbidden, &d.ForbiddenHits); err != nil {
+		return core.DiffSnapshot{}, fmt.Errorf("decode forbidden_hits: %w", err)
+	}
+	if err := decodeJSONSlice(violations, &d.ClaimViolations); err != nil {
+		return core.DiffSnapshot{}, fmt.Errorf("decode claim_violations: %w", err)
+	}
+	if err := decodeJSONSlice(reasons, &d.RiskReasons); err != nil {
+		return core.DiffSnapshot{}, fmt.Errorf("decode risk_reasons: %w", err)
+	}
+	return d, nil
+}
+
+func decodeJSONSlice(blob string, out any) error {
+	if blob == "" {
+		return nil
+	}
+	return json.Unmarshal([]byte(blob), out)
 }
 
 func nullableString(s string) any {

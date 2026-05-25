@@ -279,6 +279,98 @@ func TestStaleMarksCascadeOnAgentDelete(t *testing.T) {
 	}
 }
 
+func TestCreateAndReadLatestDiffSnapshot(t *testing.T) {
+	s := mustOpenTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateAgent(ctx, sampleAgent("a1", "billing")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.LatestDiffSnapshotByAgent(ctx, "a1")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound when no snapshot, got %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	d := core.DiffSnapshot{
+		ID:              "d1",
+		AgentID:         "a1",
+		HeadCommit:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		FilesChanged:    3,
+		LinesAdded:      120,
+		LinesRemoved:    40,
+		TouchedFiles:    []string{"pkg/billing/types.go", "pkg/billing/api.go"},
+		ForbiddenHits:   []string{},
+		ClaimViolations: []string{},
+		RiskLevel:       core.RiskLow,
+		RiskReasons:     []core.Reason{},
+		TakenAt:         now,
+	}
+	if err := s.CreateDiffSnapshot(ctx, d); err != nil {
+		t.Fatalf("CreateDiffSnapshot: %v", err)
+	}
+	got, err := s.LatestDiffSnapshotByAgent(ctx, "a1")
+	if err != nil {
+		t.Fatalf("LatestDiffSnapshotByAgent: %v", err)
+	}
+	if got.HeadCommit != d.HeadCommit || got.FilesChanged != d.FilesChanged ||
+		got.LinesAdded != d.LinesAdded || got.LinesRemoved != d.LinesRemoved ||
+		got.RiskLevel != d.RiskLevel {
+		t.Errorf("round-trip scalar mismatch: %+v vs %+v", got, d)
+	}
+	if len(got.TouchedFiles) != 2 || got.TouchedFiles[0] != "pkg/billing/types.go" {
+		t.Errorf("touched_files: %v", got.TouchedFiles)
+	}
+
+	// Insert a second, newer snapshot; latest should reflect it.
+	d2 := d
+	d2.ID = "d2"
+	d2.RiskLevel = core.RiskHigh
+	d2.TakenAt = now.Add(time.Second)
+	d2.RiskReasons = []core.Reason{{
+		Code: "files_over_high", Severity: core.SeverityHigh,
+		Detail: "31 files (>30)",
+	}}
+	if err := s.CreateDiffSnapshot(ctx, d2); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.LatestDiffSnapshotByAgent(ctx, "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "d2" || got.RiskLevel != core.RiskHigh {
+		t.Errorf("latest should be d2/high, got %+v", got)
+	}
+	if len(got.RiskReasons) != 1 || got.RiskReasons[0].Code != "files_over_high" {
+		t.Errorf("RiskReasons round-trip wrong: %+v", got.RiskReasons)
+	}
+}
+
+func TestDiffSnapshotsCascadeOnAgentDelete(t *testing.T) {
+	s := mustOpenTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateAgent(ctx, sampleAgent("a1", "agent")); err != nil {
+		t.Fatal(err)
+	}
+	d := core.DiffSnapshot{
+		ID: "d1", AgentID: "a1",
+		HeadCommit: "0000", FilesChanged: 1, LinesAdded: 1, LinesRemoved: 0,
+		TouchedFiles: []string{"a"}, ForbiddenHits: []string{},
+		ClaimViolations: []string{}, RiskLevel: core.RiskLow,
+		RiskReasons: []core.Reason{}, TakenAt: time.Now().UTC(),
+	}
+	if err := s.CreateDiffSnapshot(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM agents WHERE id = ?`, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.LatestDiffSnapshotByAgent(ctx, "a1")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected cascade delete, got %v", err)
+	}
+}
+
 func TestCreateAgentWithClaimsFKConstraint(t *testing.T) {
 	s := mustOpenTestStore(t)
 	ctx := context.Background()

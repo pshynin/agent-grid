@@ -866,5 +866,339 @@ func mapKeys(m map[string]any) []string {
 	return out
 }
 
+// ---------------------------------------------------- diff-risk + status --
+
+// newDiffRiskScenarioRepo creates a repo where:
+//   - main has one initial commit (pkg/billing/types.go).
+//   - branch `feat/billing` adds commits modifying pkg/billing/types.go (one
+//     change inside the agent's typical scope) and adding pkg/auth/session.go
+//     (outside).
+//   - main is unchanged from the initial commit so the agent's branch is
+//     purely "ahead".
+//
+// Caller should Chdir(dir) and run `agentgrid init`.
+func newDiffRiskScenarioRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("init", "-q", "-b", "main")
+	write("pkg/billing/types.go", "package billing\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "init")
+
+	run("checkout", "-q", "-b", "feat/billing")
+	// edit inside the (expected) claim
+	write("pkg/billing/types.go", "package billing\n// edited\nfunc X() {}\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "billing edit")
+	// new file outside the (expected) claim
+	write("pkg/auth/session.go", "package auth\nfunc Y() {}\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "auth new")
+	run("checkout", "-q", "main")
+	return dir
+}
+
+func TestDiffRiskPersistsAndReadsSnapshot(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "billing slice",
+		"--branch", "feat/billing",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+
+	stdout := runMustOK(t, "diff-risk", "billing", "--json")
+	var v diffRiskView
+	if err := json.Unmarshal([]byte(stdout), &v); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	// pkg/auth/session.go is outside the claim -> claim_violation (medium).
+	if v.Level != "medium" {
+		t.Errorf("Level = %q, want medium (reasons=%+v)", v.Level, v.Reasons)
+	}
+	hit := false
+	for _, r := range v.Reasons {
+		if r.Code == "claim_violation" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Errorf("missing claim_violation reason: %+v", v.Reasons)
+	}
+	if v.FilesChanged != 2 || v.LinesAdded == 0 {
+		t.Errorf("counters look wrong: %+v", v)
+	}
+	if len(v.HeadCommit) != 40 {
+		t.Errorf("HeadCommit not a sha: %q", v.HeadCommit)
+	}
+
+	// Re-read without recomputing — same shape, same level.
+	stdout2 := runMustOK(t, "diff-risk", "billing", "--no-refresh", "--json")
+	var v2 diffRiskView
+	if err := json.Unmarshal([]byte(stdout2), &v2); err != nil {
+		t.Fatalf("invalid no-refresh JSON: %v", err)
+	}
+	if v2.Level != v.Level || v2.FilesChanged != v.FilesChanged {
+		t.Errorf("--no-refresh disagreed with fresh: fresh=%+v noref=%+v", v, v2)
+	}
+}
+
+func TestDiffRiskNoRefreshErrorsWithoutSnapshot(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing")
+	_, stderr, exit := runCLI(t, "diff-risk", "billing", "--no-refresh")
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr, "no diff snapshot") {
+		t.Errorf("stderr should mention missing snapshot: %s", stderr)
+	}
+}
+
+func TestDiffRiskUnknownAgent(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	_, stderr, exit := runCLI(t, "diff-risk", "ghost")
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr, "not found") {
+		t.Errorf("stderr should mention not found: %s", stderr)
+	}
+}
+
+func TestDiffRiskForbiddenPathTriggersHigh(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	// Add a vendor file on the branch so the diff includes a forbidden path.
+	gitInRepo(t, dir, "checkout", "-q", "feat/billing")
+	if err := os.MkdirAll(filepath.Join(dir, "vendor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "vendor/lib.go"),
+		[]byte("package vendor\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, dir, "add", ".")
+	gitInRepo(t, dir, "commit", "-q", "-m", "vendor")
+	gitInRepo(t, dir, "checkout", "-q", "main")
+
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing",
+		"--claim", "glob:pkg/billing/**:edit",
+		"--claim", "glob:vendor/**:edit",
+		"--claim", "glob:pkg/auth/**:edit",
+	)
+	stdout := runMustOK(t, "diff-risk", "billing", "--json")
+	var v diffRiskView
+	if err := json.Unmarshal([]byte(stdout), &v); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if v.Level != "high" {
+		t.Errorf("Level = %q, want high", v.Level)
+	}
+	hit := false
+	for _, r := range v.Reasons {
+		if r.Code == "forbidden_path_touched" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Errorf("missing forbidden_path_touched: %+v", v.Reasons)
+	}
+	if len(v.ForbiddenHits) == 0 {
+		t.Errorf("ForbiddenHits should be non-empty: %+v", v.ForbiddenHits)
+	}
+}
+
+func TestDiffRiskJSONStableShape(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing",
+		"--claim", "glob:pkg/billing/**:edit",
+		"--claim", "glob:pkg/auth/**:edit",
+	)
+	stdout := runMustOK(t, "diff-risk", "billing", "--json")
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	want := []string{
+		"agent", "branch", "head_commit", "level", "reasons",
+		"touched_files", "forbidden_hits", "claim_violations",
+		"files_changed", "lines_added", "lines_removed", "taken_at",
+	}
+	for _, k := range want {
+		if _, ok := raw[k]; !ok {
+			t.Errorf("missing key %q in diff-risk JSON (have %v)", k, mapKeys(raw))
+		}
+	}
+}
+
+func TestStatusFieldsAndJSONShape(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+
+	// Status before any risk/stale state.
+	stdout := runMustOK(t, "status", "--json")
+	var sv []statusView
+	if err := json.Unmarshal([]byte(stdout), &sv); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if len(sv) != 1 {
+		t.Fatalf("status entries = %d, want 1", len(sv))
+	}
+	got := sv[0]
+	if got.Name != "billing" || got.Branch != "feat/billing" || got.Base != "main" {
+		t.Errorf("status fields wrong: %+v", got)
+	}
+	if got.Ahead != 2 || got.Behind != 0 {
+		t.Errorf("ahead/behind = %d/%d, want 2/0", got.Ahead, got.Behind)
+	}
+	if got.Risk != nil {
+		t.Errorf("Risk should be nil before any diff-risk snapshot, got %v", *got.Risk)
+	}
+	if got.Stale {
+		t.Errorf("Stale should be false")
+	}
+	if got.Merged {
+		t.Errorf("Merged should be false (branch has commits ahead of main)")
+	}
+
+	// JSON key stability for the present fields.
+	var raw []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"name", "branch", "base", "ahead", "behind", "risk", "stale", "merged"}
+	for _, k := range want {
+		if _, ok := raw[0][k]; !ok {
+			t.Errorf("status JSON missing key %q (have %v)", k, mapKeys(raw[0]))
+		}
+	}
+
+	// After diff-risk, status.risk should be populated.
+	runMustOK(t, "diff-risk", "billing")
+	stdout = runMustOK(t, "status", "--json")
+	sv = nil
+	if err := json.Unmarshal([]byte(stdout), &sv); err != nil {
+		t.Fatal(err)
+	}
+	if sv[0].Risk == nil {
+		t.Errorf("Risk should be populated after diff-risk")
+	} else if *sv[0].Risk == "" {
+		t.Errorf("Risk should be a non-empty string")
+	}
+}
+
+func TestStatusMergedFlag(t *testing.T) {
+	// Set up a repo where branch B is fully merged into main (its head is an
+	// ancestor of main).
+	dir := newDiffRiskScenarioRepo(t)
+	// Fast-forward main to feat/billing: now feat/billing's head is an ancestor of main's head.
+	gitInRepo(t, dir, "checkout", "-q", "main")
+	gitInRepo(t, dir, "merge", "--quiet", "--no-edit", "feat/billing")
+
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	stdout := runMustOK(t, "status", "--json")
+	var sv []statusView
+	if err := json.Unmarshal([]byte(stdout), &sv); err != nil {
+		t.Fatal(err)
+	}
+	if !sv[0].Merged {
+		t.Errorf("Merged should be true (branch head ancestor of base head); got %+v", sv[0])
+	}
+}
+
+func TestStatusStaleFlag(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "t",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:read",
+	)
+	runMustOK(t, "refresh")
+	stdout := runMustOK(t, "status", "--json")
+	var sv []statusView
+	if err := json.Unmarshal([]byte(stdout), &sv); err != nil {
+		t.Fatal(err)
+	}
+	if !sv[0].Stale {
+		t.Errorf("Stale should be true after refresh; got %+v", sv[0])
+	}
+}
+
+func TestStatusTextOutput(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "billing", "--task", "t",
+		"--branch", "feat/billing")
+	stdout := runMustOK(t, "status")
+	for _, want := range []string{"NAME", "BRANCH", "AHEAD/BEHIND", "RISK", "STALE", "MERGED", "billing", "feat/billing"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status text missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestStatusEmpty(t *testing.T) {
+	dir := newDiffRiskScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	stdout := runMustOK(t, "status")
+	if !strings.Contains(stdout, "no agents registered") {
+		t.Errorf("expected empty hint: %s", stdout)
+	}
+}
+
 // keep the import alive if other tests trim down later
 var _ = fmt.Sprintf
