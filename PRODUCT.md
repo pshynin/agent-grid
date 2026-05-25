@@ -20,7 +20,8 @@ Primary:
   (Claude Code, Codex CLI, Cursor CLI, Gemini CLI, remote sandboxes).
 - Engineers using git worktrees + tmux + GitHub PRs as their default loop.
 - Engineers who follow a vertical-slice / small-PR discipline
-  (e.g. `ai-agent-playbook` users) and need a runtime that enforces it.
+  (e.g. [`agent-playbook`](https://github.com/pshynin/agent-playbook) users)
+  and need a runtime that enforces it.
 
 Secondary (later phases):
 
@@ -179,11 +180,12 @@ V1 is successful if:
 - Diff-risk and stale signals are trusted enough that engineers act on them
   without re-deriving by hand.
 
-## 11. Relationship to `ai-agent-playbook`
+## 11. Relationship to `agent-playbook`
 
-- `ai-agent-playbook` defines **methodology**: agent roles (architect, slice
-  worker, reviewer, QA, security), feature brief templates, vertical-slice
-  workflow, small-PR discipline, review checklists, CLAUDE.md templates.
+- [`agent-playbook`](https://github.com/pshynin/agent-playbook) defines
+  **methodology**: agent roles (architect, slice worker, reviewer, QA,
+  security), feature brief templates, vertical-slice workflow, small-PR
+  discipline, review checklists, CLAUDE.md templates.
 - AgentGrid is the **runtime** that holds engineers and agents to that
   methodology: it captures the intent the playbook tells you to declare,
   enforces the small-PR discipline the playbook recommends, and produces the
