@@ -45,11 +45,12 @@ layer that catches them.
 
 AgentGrid does not replace any of these. It composes with them.
 
-## Relationship to `ai-agent-playbook`
+## Relationship to `agent-playbook`
 
-- [`ai-agent-playbook`](#) defines **methodology** — agent roles
-  (architect, slice worker, reviewer, QA, security), feature brief templates,
-  vertical-slice workflow, small-PR discipline, review checklists.
+- [`agent-playbook`](https://github.com/pshynin/agent-playbook) defines
+  **methodology** — agent roles (architect, slice worker, reviewer, QA,
+  security), feature brief templates, vertical-slice workflow, small-PR
+  discipline, review checklists.
 - **AgentGrid is the runtime** that enforces that methodology: it captures the
   intent the playbook tells you to declare, refuses to let two agents declare
   the same scope, surfaces stale work, and pushes back on oversized PRs.
