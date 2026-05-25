@@ -1,184 +1,234 @@
 # AgentGrid
 
-> A local control plane for running many coding agents in parallel — without
-> turning your repo into one giant unreviewable PR.
+> AgentGrid is a local control plane for coordinating multiple coding agents
+> across branches by tracking claims, stale work, and diff risk.
 
-AgentGrid is a single-binary CLI that sits next to `git`, `tmux`, `gh`, and
-Claude Code. It tracks which agent owns which task, which files each agent
-plans to touch, who is stepping on whom, whose branch went stale, and which
-diff has grown too large to review.
+It is a single Go binary plus a SQLite file under `.agentgrid/`. It runs
+next to `git`. It does not launch coding agents, does not manage worktrees
+for you, does not call any AI model, does not open PRs, and does not run a
+dashboard.
 
-It is **not** another agent launcher. It is the missing **coordination layer**
-that becomes necessary the moment you run more than one coding agent at a
-time.
+## Problem
 
----
+One coding agent in one terminal is easy. Five agents across branches,
+worktrees, terminals, and PRs becomes coordination chaos:
 
-## Why this exists
-
-One Claude Code session in one terminal is easy.
-
-Five agents across branches, worktrees, PRs, terminals, and machines is a
-systems problem:
-
-- Two agents silently edit the same file and produce conflicting branches.
-- Agent B planned to refactor a module that Agent A is already rewriting —
+- Two agents silently edit the same file.
+- Agent B planned to refactor a module that Agent A already changed —
   B's plan is stale before its first commit.
-- An agent produces a 4,000-line diff that no one can review.
-- An agent touches `migrations/` or `infra/prod/` without anyone noticing
+- An agent grows a 4,000-line diff no one can review.
+- An agent touches `vendor/` or `migrations/` without anyone noticing
   until CI.
-- Three branches are technically ready for review but no one remembers
-  which.
 
-These are coordination failures, not model failures. AgentGrid is the boring
+These are coordination problems, not model problems. AgentGrid is the boring
 layer that catches them.
 
-## How it relates to other tools
+The MVP value sentence:
 
-| Tool                                  | Role                                          | AgentGrid's role               |
-| ------------------------------------- | --------------------------------------------- | ------------------------------ |
-| Claude Code (and worktrees)           | Run an agent in a session.                    | Track *what* the agent owns.   |
-| Workmux / Claude Squad / Kage / Loom  | Manage tmux + worktree ergonomics.            | Manage *intent and conflict*.  |
-| jcode / Ruflo                         | Broader harness, swarms.                      | Stay narrow: coordination.     |
-| Depot Remote Agents                   | Move execution off the laptop.                | Local source of truth.         |
-| GitHub Agent HQ / Copilot agents      | Push agents into PRs and CI (post-PR).        | Pre-PR coordination.           |
+> *"Agent B is stale because main changed `src/auth/session.ts` after Agent
+> B claimed/read it."*
 
-AgentGrid does not replace any of these. It composes with them.
+## What AgentGrid does today
 
-## Relationship to `agent-playbook`
+The v0.1 MVP coordination engine:
 
-- [`agent-playbook`](https://github.com/pshynin/agent-playbook) defines
-  **methodology** — agent roles (architect, slice worker, reviewer, QA,
-  security), feature brief templates, vertical-slice workflow, small-PR
-  discipline, review checklists.
-- **AgentGrid is the runtime** that enforces that methodology: it captures the
-  intent the playbook tells you to declare, refuses to let two agents declare
-  the same scope, surfaces stale work, and pushes back on oversized PRs.
+- Registers coding-agent tasks against existing branches.
+- Records path and glob claims (`edit` or `read`) before work starts.
+- Detects claim overlap and refuses conflicting claims (`read+read` is
+  allowed; any pairing involving `edit` is a hard conflict).
+- Detects stale agents when files they claimed have changed on the base
+  branch since they branched off, and recommends `rebase`, `review`, or
+  `re-plan`.
+- Scores branch diffs against configurable thresholds and forbidden
+  paths, returning `low`, `medium`, or `high` with structured reason
+  codes.
+- Shows one status table across all agents with branch, ahead/behind,
+  latest risk level, stale flag, and merged flag.
+- Stable `--json` output on every read command for scripting.
 
-If the playbook says "declare your scope before you start," AgentGrid is the
-thing that refuses to let two agents declare the same scope.
+## What AgentGrid does not do yet
 
-## Status
+Explicitly out of scope for v0.1:
 
-**Phase 0 — design.** No implementation yet. The design lives in:
+- Does **not** launch Claude (or any other coding agent).
+- Does **not** create or manage git worktrees.
+- Does **not** create, comment on, or merge PRs.
+- Does **not** run or attach to tmux sessions.
+- Does **not** call AI models or use embeddings.
+- Does **not** run a dashboard, web UI, or server.
+- Does **not** auto-merge, auto-rebase, or auto-resolve anything.
+- Does **not** sync state across machines.
 
-- [`PRODUCT.md`](PRODUCT.md) — vision, users, scope, non-goals.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — modules, data flow, boundaries.
-- [`ROADMAP.md`](ROADMAP.md) — phases 0–9, MVP cut lines.
-- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — Go layout, first 10
-  tasks.
-- [`SCHEMA.md`](SCHEMA.md) — SQLite schema.
-- [`ALGORITHMS.md`](ALGORITHMS.md) — overlap, stale, diff-risk, status,
-  cleanup.
-- [`CLI_SPEC.md`](CLI_SPEC.md) — every command, every flag, every output.
+These are tracked as future layers in `ROADMAP.md`. None of them are
+prerequisites for the value the MVP provides.
 
-## Quick start (planned)
+## Quickstart
 
-> The commands below describe the MVP target. The binary doesn't exist yet.
+Requires `git >= 2.20`. Run inside an existing git repository.
 
 ```sh
-# 1. Install (once published)
-brew install <user>/agentgrid/agentgrid
+# 1. Install
+go install github.com/pshynin/agent-grid/cmd/agentgrid@latest
 
-# 2. Inside a git repo
+# 2. Initialize AgentGrid in your repo
 agentgrid init
 
-# 3. Register an agent and its intended scope
+# 3. Register an agent against a branch you already created
+git checkout -b feat/billing
+git checkout main
 agentgrid agent add \
-  --name billing-extract \
+  --name billing \
   --task "extract billing module" \
+  --branch feat/billing \
   --claim glob:pkg/billing/**:edit \
   --claim glob:internal/invoice/**:read
 
-# 4. Create a worktree + branch for that agent
-agentgrid spawn --from billing-extract
+# 4. Probe before committing to a new claim (writes nothing)
+agentgrid claim check glob:pkg/billing/sub/**:edit
 
-# 5. Open Claude Code (or your runner) in the worktree
-cd .agentgrid/worktrees/billing-extract && claude
-
-# 6. From any other terminal, see everything at once
-agentgrid status
-
-# 7. After commits, refresh state and check risk
+# 5. After other branches have moved on, recompute stale state
 agentgrid refresh
-agentgrid diff-risk billing-extract
+agentgrid stale
 
-# 8. When ready, hand off to GitHub
-agentgrid pr billing-extract --open
+# 6. Score the agent's branch against thresholds and forbidden paths
+agentgrid diff-risk billing
+
+# 7. One table across all agents
+agentgrid status
 ```
+
+A copy-paste end-to-end walkthrough lives in
+[`docs/MVP_DEMO.md`](docs/MVP_DEMO.md).
+
+## Exit codes
+
+| Code | Meaning           | Examples                                              |
+| ---- | ----------------- | ----------------------------------------------------- |
+| `0`  | ok                | command succeeded                                     |
+| `1`  | user error        | unknown agent, missing branch, malformed claim spec   |
+| `2`  | system error      | (reserved; not used in v0.1)                          |
+| `3`  | policy refusal    | overlapping `edit` claim, `claim check` finds conflict |
+
+All commands are deterministic and idempotent where it makes sense.
+`refresh` is safe to re-run; `claim check` and `--no-refresh` modes write
+nothing.
+
+## Why not just use Claude Code worktrees, Workmux, or Claude Squad?
+
+Those tools help you **run** coding-agent sessions. AgentGrid tracks the
+**coordination risk around those sessions**:
+
+- Did anyone else already claim the path you're about to touch?
+- Did the base branch move under your feet while you were working?
+- Did your branch grow too large, drift outside your declared scope, or
+  touch a forbidden path?
+
+AgentGrid composes with whatever launcher and terminal multiplexer you use.
+It is not a launcher and not a multiplexer. There is one source of truth
+(the SQLite file under `.agentgrid/`) and you keep using `git` directly.
+
+## Relationship to `agent-playbook`
+
+- [`agent-playbook`](https://github.com/pshynin/agent-playbook) defines the
+  **methodology**: agent roles, feature brief templates, vertical-slice
+  workflow, small-PR discipline, review checklists.
+- AgentGrid is the **runtime** that enforces a slice of that methodology:
+  declare your scope before you start, and AgentGrid will refuse to let two
+  agents declare the same scope.
 
 ## Core concepts
 
-1. **Agent registry.** Every agent session has a name, role, task, branch,
-   worktree, owner, status.
-2. **Claim before touch.** Before an agent edits anything, it registers its
-   intent (paths/modules + edit/read). Overlapping `edit` claims are blocked.
-3. **Stale detection.** When another agent's commits land in your base
-   branch and they touch files you claimed or already modified, your agent
-   is marked stale with a recommendation (rebase, re-plan, narrow, abandon).
-4. **Diff-risk scoring.** Files / lines / modules / forbidden paths /
-   missing tests / claim violations → `low | medium | high`. HIGH blocks PR
-   creation without an explicit override.
-5. **Review queue.** `agentgrid status` groups every agent into a bucket:
-   `working`, `blocked`, `stale`, `diff_too_large`, `ready_for_pr`,
-   `pr_open`, `merged`, `abandoned`.
-6. **GitHub handoff.** `agentgrid pr <agent>` renders a structured PR body
-   (task, claimed scope, actual changes, risk, tests, reviewer notes) and
-   shells out to `gh`.
-7. **Human in control.** AgentGrid never auto-merges, never force-pushes,
-   never rewrites history. It informs, warns, and queues.
+1. **Agent.** A name, a task, a branch, a base branch, and a captured
+   base commit. AgentGrid does not own the branch — `git` does. AgentGrid
+   only records the coordination metadata.
+2. **Claim.** A pattern (`path` or `glob`) plus an intent (`edit` or
+   `read`) that an agent declares before starting work. `read+read`
+   overlap is allowed; any pairing involving `edit` is a hard conflict.
+3. **Stale mark.** Set by `refresh` when files on the base branch
+   changed inside any of the agent's claimed scope since the live
+   merge-base of `branch` and `base_branch`. Rebasing past the change
+   clears the mark on the next `refresh`.
+4. **Diff-risk snapshot.** Computed by `diff-risk`. Files, lines,
+   forbidden-path hits, and out-of-claim files combine into a
+   `low | medium | high` level with structured reason codes. Persisted to
+   SQLite so `status` and `--no-refresh` can read it without touching git.
+5. **Status row.** A derived view: name, branch, base, ahead/behind,
+   latest risk level (or `-`), stale flag, merged flag.
 
-## Example workflow
+## Configuration
 
-1. `agentgrid init` inside the repo.
-2. Engineer drafts a slice for billing extraction.
-3. `agentgrid agent add ... --claim glob:pkg/billing/**:edit`.
-4. AgentGrid checks for overlap — none. Records the agent.
-5. `agentgrid spawn` creates `pkg/.agentgrid/worktrees/billing-extract` and
-   a branch off `main`.
-6. Engineer opens Claude Code in that worktree.
-7. A second agent is added for invoice work. Its claim overlaps the first.
-   AgentGrid **blocks** the add until the scope is narrowed.
-8. The first agent merges. The third agent — which had a read claim on
-   `pkg/billing/types.go` — is marked **stale** on the next `refresh`.
-9. The third agent grows to 47 files / 2,300 lines. `diff-risk` reports
-   **HIGH**. The engineer splits the work before opening a PR.
-10. `agentgrid pr` opens a PR with a structured body. Human reviews and
-    merges.
-11. `agentgrid cleanup` proposes safe removal of the merged worktree and
-    branch.
+`agentgrid init` writes `.agentgrid/config.yaml` with documented
+defaults:
 
-## Non-goals
+```yaml
+version: 1
+default_base_branch: main
 
-AgentGrid will not:
+forbidden_paths:
+  - vendor/**
+  - node_modules/**
+  - migrations/**
+  - infra/prod/**
 
-- Implement a new agent framework, planner, or scheduler.
-- Be a chat UI or an "agent IDE."
-- Auto-merge, auto-rebase, or auto-resolve conflicts.
-- Run agents remotely (no cloud sandbox in MVP).
-- Replace Claude Code, Workmux, Claude Squad, jcode, Ruflo, or `gh`.
-- Provide a multi-machine or team dashboard in the MVP.
-- Hide `git` or `tmux` — both remain the user's primary tools.
+test_file_globs:
+  - "**/*_test.go"
+  - "**/test/**"
+  - "**/__tests__/**"
 
-If something feels like Airflow for coding agents, it's the wrong direction.
+diff_risk:
+  thresholds:
+    files_low: 5
+    files_medium: 15
+    files_high: 30
+    lines_low: 200
+    lines_medium: 600
+    lines_high: 1500
+```
+
+The config is validated on every command; misconfigured values give a
+single clear error and exit `1`.
 
 ## Design principles
 
-- **Local first.** One Go binary, one SQLite file under `.agentgrid/`. No
-  daemon, no server in the MVP.
-- **Shell out, don't reimplement.** `git`, `tmux`, `gh` are the right tools;
-  we orchestrate them.
-- **Pull-based.** You run `refresh` when you want fresh state. Watchers are
-  optional and later.
-- **Policy is pure.** All coordination rules are pure functions, table-tested.
-- **Small surface.** A dozen commands beat fifty.
+- **Local first.** One Go binary, one SQLite file under `.agentgrid/`.
+  No daemon, no server, no network calls.
+- **Shell out, don't reimplement.** `git` does git; AgentGrid orchestrates.
+- **Pull-based.** Run `refresh` when you want fresh state. Watchers are
+  out of scope.
+- **Policy is pure.** All coordination rules live in `internal/policy`
+  as deterministic, table-tested functions.
+- **Human owns the decision.** AgentGrid informs, warns, and refuses.
+  It never merges, rebases, or rewrites history.
+
+## Status
+
+**MVP coordination engine implemented.**
+v0.1 is shippable as a `go install` binary. The eight commands listed in
+the quickstart all work end-to-end.
+
+Future layers (`spawn`, tmux integration, GitHub/PR handoff, review queue
+buckets, dashboards, multi-machine sync) are **not** part of v0.1. They
+are described in [`ROADMAP.md`](ROADMAP.md) and may or may not be built
+depending on whether the MVP loop proves valuable in practice.
+
+> Note on CLI name: `agentgrid` is the primary command. A shorter `ag`
+> alias may be added later, but it is not implemented and should not be
+> used in scripts.
+
+## Design documents
+
+The product and engineering documents that drove the MVP:
+
+- [`PRODUCT.md`](PRODUCT.md) — vision, target users, non-goals (forward-looking).
+- [`MVP.md`](MVP.md) — locked v0.1 scope.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — modules, data flow, boundaries.
+- [`ROADMAP.md`](ROADMAP.md) — phases 0–9 and cut lines.
+- [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — Go layout and task order.
+- [`SCHEMA.md`](SCHEMA.md) — SQLite schema.
+- [`ALGORITHMS.md`](ALGORITHMS.md) — overlap, stale, diff-risk, status.
+- [`CLI_SPEC.md`](CLI_SPEC.md) — full command surface (some flags are
+  forward-looking; see help text for what ships in v0.1).
 
 ## License
 
-To be decided before the first release (likely MIT or Apache-2.0).
-
-## Contributing
-
-This project is in Phase 0 (design). Issues and design feedback are welcome;
-implementation contributions wait until after the first release branch is
-cut.
+To be decided before the first tagged release (likely MIT or Apache-2.0).

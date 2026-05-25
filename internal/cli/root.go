@@ -10,8 +10,9 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "agentgrid",
 		Short: "Local control plane for parallel coding agents",
-		Long: "AgentGrid coordinates multiple coding agents working in git worktrees:\n" +
-			"claim-before-touch, stale detection, and diff-risk scoring.",
+		Long: "AgentGrid is a local control plane for coordinating multiple coding\n" +
+			"agents across branches: claim-before-touch, stale detection, and\n" +
+			"diff-risk scoring.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
