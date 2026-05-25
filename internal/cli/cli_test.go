@@ -520,5 +520,351 @@ func TestAgentShowEmptyClaims(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------- refresh / stale --
+
+// newStaleScenarioRepo sets up a repo where:
+//   - main has one initial commit X (the file `pkg/billing/types.go` exists).
+//   - branch `agent-c` is created at X and immediately checked back out
+//     leaving us on main.
+//   - main advances by one commit that modifies `pkg/billing/types.go`,
+//     simulating agent A having merged into main.
+// The returned dir is the repo root; the test should `t.Chdir(dir)` after.
+func newStaleScenarioRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(dir, "pkg/billing"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg/billing/types.go"),
+		[]byte("package billing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg/auth.go"),
+		[]byte("package auth\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-q", "-m", "init")
+
+	// Branch agent-c off the initial commit and switch back to main.
+	run("checkout", "-q", "-b", "agent-c")
+	run("checkout", "-q", "main")
+
+	// Agent A's effect: a new commit on main touching pkg/billing/types.go.
+	if err := os.WriteFile(filepath.Join(dir, "pkg/billing/types.go"),
+		[]byte("package billing\n// changed by A\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-q", "-m", "A modifies types")
+	return dir
+}
+
+// gitInRepo runs a git command in dir; fails the test on non-zero exit.
+func gitInRepo(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func TestRefreshMarksAndClearsStale(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "be the second agent",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:read",
+	)
+
+	// First refresh: C should be stale with one conflicting file and the
+	// 'review' recommendation (read-only claim).
+	stdout := runMustOK(t, "refresh", "--json")
+	var rj struct {
+		Refreshed []refreshResult `json:"refreshed"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rj); err != nil {
+		t.Fatalf("invalid refresh JSON: %v\n%s", err, stdout)
+	}
+	if len(rj.Refreshed) != 1 {
+		t.Fatalf("got %d refreshed agents, want 1", len(rj.Refreshed))
+	}
+	got := rj.Refreshed[0]
+	if got.Agent != "C" || !got.Stale {
+		t.Errorf("first refresh: %+v", got)
+	}
+	if got.Recommendation != "review" {
+		t.Errorf("recommendation = %q, want review", got.Recommendation)
+	}
+	if len(got.ConflictingFiles) != 1 || got.ConflictingFiles[0] != "pkg/billing/types.go" {
+		t.Errorf("conflicting files = %v", got.ConflictingFiles)
+	}
+
+	// `stale` command should list C.
+	stdoutS := runMustOK(t, "stale", "--json")
+	var sv []staleView
+	if err := json.Unmarshal([]byte(stdoutS), &sv); err != nil {
+		t.Fatalf("invalid stale JSON: %v\n%s", err, stdoutS)
+	}
+	if len(sv) != 1 {
+		t.Fatalf("stale = %+v", sv)
+	}
+	if sv[0].Agent != "C" || sv[0].Branch != "agent-c" ||
+		sv[0].Recommendation != "review" || len(sv[0].ConflictingFiles) != 1 ||
+		sv[0].ConflictingFiles[0] != "pkg/billing/types.go" {
+		t.Errorf("stale view = %+v", sv[0])
+	}
+	if sv[0].CreatedAt.IsZero() {
+		t.Errorf("stale.created_at should be set")
+	}
+	if sv[0].Reason == "" || !strings.Contains(sv[0].Reason, "claimed scope") {
+		t.Errorf("stale reason missing 'claimed scope': %q", sv[0].Reason)
+	}
+
+	// C "rebases past" the change. Use fast-forward merge of main into
+	// agent-c since agent-c had no commits of its own: end result is the
+	// same as a successful rebase — merge-base(agent-c, main) advances to
+	// main's HEAD.
+	gitInRepo(t, dir, "checkout", "-q", "agent-c")
+	gitInRepo(t, dir, "merge", "--quiet", "--no-edit", "main")
+
+	// Second refresh: stale should be cleared.
+	runMustOK(t, "refresh")
+	stdoutS = runMustOK(t, "stale", "--json")
+	sv = nil
+	if err := json.Unmarshal([]byte(stdoutS), &sv); err != nil {
+		t.Fatalf("invalid stale JSON: %v\n%s", err, stdoutS)
+	}
+	if len(sv) != 0 {
+		t.Errorf("stale should be empty after merge-up, got %+v", sv)
+	}
+}
+
+func TestRefreshEditClaimRecommendsRebase(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "edit claim variant",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	stdout := runMustOK(t, "refresh", "--json")
+	var rj struct {
+		Refreshed []refreshResult `json:"refreshed"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rj); err != nil {
+		t.Fatalf("invalid refresh JSON: %v\n%s", err, stdout)
+	}
+	if !rj.Refreshed[0].Stale {
+		t.Fatalf("expected stale: %+v", rj.Refreshed[0])
+	}
+	if rj.Refreshed[0].Recommendation != "rebase" {
+		t.Errorf("recommendation = %q, want rebase", rj.Refreshed[0].Recommendation)
+	}
+}
+
+func TestRefreshNoOverlapNoStale(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	// Claim something unrelated to the file A modified.
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "no overlap",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/auth/**:edit",
+	)
+	stdout := runMustOK(t, "refresh", "--json")
+	var rj struct {
+		Refreshed []refreshResult `json:"refreshed"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rj); err != nil {
+		t.Fatalf("invalid refresh JSON: %v\n%s", err, stdout)
+	}
+	if rj.Refreshed[0].Stale {
+		t.Errorf("expected not stale: %+v", rj.Refreshed[0])
+	}
+	stdoutS := runMustOK(t, "stale", "--json")
+	var sv []staleView
+	if err := json.Unmarshal([]byte(stdoutS), &sv); err != nil {
+		t.Fatalf("stale JSON: %v", err)
+	}
+	if len(sv) != 0 {
+		t.Errorf("stale list should be empty: %+v", sv)
+	}
+}
+
+func TestRefreshAgentFilter(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "first",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	// A second agent on the same branch with a non-overlapping claim.
+	runMustOK(t, "agent", "add",
+		"--name", "D", "--task", "second",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/auth/**:edit",
+	)
+
+	stdout := runMustOK(t, "refresh", "--agent", "C", "--json")
+	var rj struct {
+		Refreshed []refreshResult `json:"refreshed"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rj); err != nil {
+		t.Fatalf("invalid refresh JSON: %v\n%s", err, stdout)
+	}
+	if len(rj.Refreshed) != 1 {
+		t.Fatalf("expected exactly 1 refreshed agent, got %d: %+v", len(rj.Refreshed), rj.Refreshed)
+	}
+	if rj.Refreshed[0].Agent != "C" {
+		t.Errorf("refreshed wrong agent: %q", rj.Refreshed[0].Agent)
+	}
+	if !rj.Refreshed[0].Stale {
+		t.Errorf("C should be stale")
+	}
+
+	// D was not touched by --agent C; its stale mark (or lack thereof) stays
+	// at whatever ReplaceStaleMarksForAgent has not been called for it. The
+	// `stale` list should still contain only C.
+	stdoutS := runMustOK(t, "stale", "--json")
+	var sv []staleView
+	if err := json.Unmarshal([]byte(stdoutS), &sv); err != nil {
+		t.Fatal(err)
+	}
+	if len(sv) != 1 || sv[0].Agent != "C" {
+		t.Errorf("stale should list only C, got %+v", sv)
+	}
+}
+
+func TestRefreshUnknownAgentExitsOne(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	_, stderr, exit := runCLI(t, "refresh", "--agent", "ghost")
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr, "not found") {
+		t.Errorf("stderr should mention not found: %s", stderr)
+	}
+}
+
+func TestRefreshDeletedBaseBranchFails(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "t",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	// Switch off main so we can delete it.
+	gitInRepo(t, dir, "checkout", "-q", "agent-c")
+	gitInRepo(t, dir, "branch", "-D", "main")
+
+	_, stderr, exit := runCLI(t, "refresh")
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr, "base branch") || !strings.Contains(stderr, "no longer exists") {
+		t.Errorf("stderr should explain missing base branch: %s", stderr)
+	}
+}
+
+func TestRefreshDeletedAgentBranchFails(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "t",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	gitInRepo(t, dir, "branch", "-D", "agent-c")
+
+	_, stderr, exit := runCLI(t, "refresh")
+	if exit != 1 {
+		t.Errorf("exit = %d, want 1", exit)
+	}
+	if !strings.Contains(stderr, "branch") || !strings.Contains(stderr, "no longer exists") {
+		t.Errorf("stderr should explain missing branch: %s", stderr)
+	}
+}
+
+func TestStaleEmpty(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	stdout := runMustOK(t, "stale")
+	if !strings.Contains(stdout, "no stale agents") {
+		t.Errorf("expected 'no stale agents': %s", stdout)
+	}
+	stdout = runMustOK(t, "stale", "--json")
+	stdout = strings.TrimSpace(stdout)
+	// Either [] or null is acceptable; require the array form for stability.
+	if stdout != "[]" {
+		t.Errorf("stale --json should be [] when empty, got %q", stdout)
+	}
+}
+
+func TestStaleJSONStableShape(t *testing.T) {
+	dir := newStaleScenarioRepo(t)
+	t.Chdir(dir)
+	runMustOK(t, "init")
+	runMustOK(t, "agent", "add",
+		"--name", "C", "--task", "t",
+		"--branch", "agent-c",
+		"--claim", "glob:pkg/billing/**:edit",
+	)
+	runMustOK(t, "refresh")
+	stdout := runMustOK(t, "stale", "--json")
+
+	var raw []map[string]any
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if len(raw) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(raw))
+	}
+	want := []string{"agent", "branch", "reason", "recommendation", "conflicting_files", "created_at"}
+	for _, k := range want {
+		if _, ok := raw[0][k]; !ok {
+			t.Errorf("stale JSON missing key %q; got keys %v", k, mapKeys(raw[0]))
+		}
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // keep the import alive if other tests trim down later
 var _ = fmt.Sprintf

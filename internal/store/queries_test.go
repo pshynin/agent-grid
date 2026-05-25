@@ -196,6 +196,89 @@ func TestCreateAgentWithClaimsAtomic(t *testing.T) {
 	}
 }
 
+func TestReplaceStaleMarksForAgent(t *testing.T) {
+	s := mustOpenTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateAgent(ctx, sampleAgent("a1", "agent")); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	mark := core.StaleMark{
+		ID:               "m1",
+		AgentID:          "a1",
+		Reason:           "base advanced into claimed scope (2 files)",
+		ConflictingFiles: []string{"pkg/billing/types.go", "pkg/billing/api.go"},
+		Recommendation:   core.RecommendReview,
+		CreatedAt:        now,
+	}
+	if err := s.ReplaceStaleMarksForAgent(ctx, "a1", []core.StaleMark{mark}); err != nil {
+		t.Fatalf("ReplaceStaleMarksForAgent: %v", err)
+	}
+
+	got, err := s.ListStaleMarks(ctx)
+	if err != nil {
+		t.Fatalf("ListStaleMarks: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d marks, want 1", len(got))
+	}
+	g := got[0]
+	if g.ID != mark.ID || g.AgentID != mark.AgentID || g.Reason != mark.Reason ||
+		g.Recommendation != mark.Recommendation {
+		t.Errorf("scalar mismatch: got %+v", g)
+	}
+	if len(g.ConflictingFiles) != 2 ||
+		g.ConflictingFiles[0] != mark.ConflictingFiles[0] ||
+		g.ConflictingFiles[1] != mark.ConflictingFiles[1] {
+		t.Errorf("files mismatch: %v", g.ConflictingFiles)
+	}
+
+	// Replace with a different mark; the old one must be gone.
+	mark2 := mark
+	mark2.ID = "m2"
+	mark2.Reason = "second"
+	if err := s.ReplaceStaleMarksForAgent(ctx, "a1", []core.StaleMark{mark2}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ListStaleMarks(ctx)
+	if len(got) != 1 || got[0].ID != "m2" {
+		t.Errorf("replacement failed: %+v", got)
+	}
+
+	// Clear by passing empty slice.
+	if err := s.ReplaceStaleMarksForAgent(ctx, "a1", nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.ListStaleMarks(ctx)
+	if len(got) != 0 {
+		t.Errorf("expected zero marks after clear, got %+v", got)
+	}
+}
+
+func TestStaleMarksCascadeOnAgentDelete(t *testing.T) {
+	s := mustOpenTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateAgent(ctx, sampleAgent("a1", "agent")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := s.ReplaceStaleMarksForAgent(ctx, "a1", []core.StaleMark{{
+		ID: "m1", AgentID: "a1", Reason: "r",
+		ConflictingFiles: []string{"x"}, Recommendation: core.RecommendRebase,
+		CreatedAt: now,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM agents WHERE id = ?`, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.ListStaleMarks(ctx)
+	if len(got) != 0 {
+		t.Errorf("FK cascade expected; got %+v", got)
+	}
+}
+
 func TestCreateAgentWithClaimsFKConstraint(t *testing.T) {
 	s := mustOpenTestStore(t)
 	ctx := context.Background()

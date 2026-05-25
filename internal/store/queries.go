@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -137,6 +138,67 @@ func (s *Store) CreateAgentWithClaims(ctx context.Context, a core.Agent, claims 
 	return tx.Commit()
 }
 
+// --- Stale marks -----------------------------------------------------------
+
+// ListStaleMarks returns every current stale mark across all agents, ordered
+// by creation time.
+func (s *Store) ListStaleMarks(ctx context.Context) ([]core.StaleMark, error) {
+	rows, err := s.db.QueryContext(ctx, staleSelectAll)
+	if err != nil {
+		return nil, fmt.Errorf("list stale_marks: %w", err)
+	}
+	defer rows.Close()
+	var out []core.StaleMark
+	for rows.Next() {
+		m, err := scanStaleMark(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceStaleMarksForAgent atomically deletes the existing stale marks for
+// the agent and inserts the supplied ones. Pass an empty marks slice to
+// clear staleness without leaving leftover rows.
+func (s *Store) ReplaceStaleMarksForAgent(ctx context.Context, agentID string, marks []core.StaleMark) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM stale_marks WHERE agent_id = ?`, agentID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, m := range marks {
+		files, err := json.Marshal(emptyStringsToNil(m.ConflictingFiles))
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("encode conflicting_files: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO stale_marks
+			   (id, agent_id, reason, conflicting_files, recommendation, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			m.ID, agentID, m.Reason, string(files), string(m.Recommendation),
+			m.CreatedAt.UTC().Format(timeFmt),
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func emptyStringsToNil(s []string) []string {
+	if len(s) == 0 {
+		return []string{}
+	}
+	return s
+}
+
 // --- helpers ---------------------------------------------------------------
 
 const (
@@ -149,6 +211,9 @@ const (
 
 	claimSelectAll     = `SELECT ` + claimCols + ` FROM claims ORDER BY created_at ASC, id ASC`
 	claimSelectByAgent = `SELECT ` + claimCols + ` FROM claims WHERE agent_id = ? ORDER BY created_at ASC, id ASC`
+
+	staleCols      = `id, agent_id, reason, conflicting_files, recommendation, created_at`
+	staleSelectAll = `SELECT ` + staleCols + ` FROM stale_marks ORDER BY created_at ASC, id ASC`
 )
 
 type rowScanner interface {
@@ -201,6 +266,26 @@ func scanClaim(r rowScanner) (core.Claim, error) {
 	}
 	c.CreatedAt = t
 	return c, nil
+}
+
+func scanStaleMark(r rowScanner) (core.StaleMark, error) {
+	var m core.StaleMark
+	var rec, createdAt, files string
+	if err := r.Scan(&m.ID, &m.AgentID, &m.Reason, &files, &rec, &createdAt); err != nil {
+		return core.StaleMark{}, err
+	}
+	m.Recommendation = core.Recommendation(rec)
+	t, err := time.Parse(timeFmt, createdAt)
+	if err != nil {
+		return core.StaleMark{}, fmt.Errorf("parse created_at: %w", err)
+	}
+	m.CreatedAt = t
+	if files != "" {
+		if err := json.Unmarshal([]byte(files), &m.ConflictingFiles); err != nil {
+			return core.StaleMark{}, fmt.Errorf("decode conflicting_files: %w", err)
+		}
+	}
+	return m, nil
 }
 
 func nullableString(s string) any {
