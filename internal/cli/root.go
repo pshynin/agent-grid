@@ -13,7 +13,7 @@ func NewRootCmd() *cobra.Command {
 		Long: "AgentGrid coordinates multiple coding agents working in git worktrees:\n" +
 			"claim-before-touch, stale detection, and diff-risk scoring.",
 		SilenceUsage:  true,
-		SilenceErrors: false,
+		SilenceErrors: true,
 	}
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newVersionCmd())
