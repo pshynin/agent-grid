@@ -20,6 +20,8 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newClaimCmd())
 	root.AddCommand(newRefreshCmd())
 	root.AddCommand(newStaleCmd())
+	root.AddCommand(newDiffRiskCmd())
+	root.AddCommand(newStatusCmd())
 	root.AddCommand(newVersionCmd())
 	return root
 }
